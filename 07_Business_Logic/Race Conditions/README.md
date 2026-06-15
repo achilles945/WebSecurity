@@ -15,9 +15,8 @@
 6. [Hidden Multi-Step Sequences](#6-hidden-multi-step-sequences)
 7. [Detection Methodology](#7-detection-methodology)
 8. [Obstacles & How to Beat Them](#8-obstacles--how-to-beat-them)
-9. [Lab Walkthroughs (Step-by-Step)](#9-lab-walkthroughs-step-by-step)
-10. [Defense & Prevention](#10-defense--prevention)
-11. [Quick Reference Cheat Sheet](#11-quick-reference-cheat-sheet)
+9. [Defense & Prevention](#9-defense--prevention)
+10. [Quick Reference Cheat Sheet](#10-quick-reference-cheat-sheet)
 
 ---
 
@@ -375,140 +374,7 @@ If endpoints have mismatched processing times and warming doesn't fix it:
 
 ---
 
-## 9. Lab Walkthroughs (Step-by-Step)
-
-### Lab 1: Limit Overrun — Discount Code
-
-**Goal:** Apply a single-use discount code multiple times.
-
-```
-1. Buy cheapest item and apply discount code once — study the flow.
-2. In Proxy History, find POST /cart/coupon.
-3. Send to Repeater → add to group → duplicate 19 times (20 total).
-4. Send group in SEQUENCE → observe: first succeeds, rest return "Coupon already applied".
-5. Remove discount from cart.
-6. Send group in PARALLEL → observe: multiple "success" responses.
-7. Refresh cart → confirm discount applied more than once.
-8. Clear cart, add target item (leather jacket), repeat parallel attack until total < store credit.
-9. Place order.
-```
-
----
-
-### Lab 2: Bypass Rate Limit — Brute-Force Login
-
-**Goal:** Test more than 3 passwords per account by racing before the lockout counter increments.
-
-```
-1. Log in wrong 3+ times → confirm lockout triggers.
-2. Find POST /login in Proxy History, send to Repeater.
-3. Group + duplicate 19 times.
-4. Send in SEQUENCE → hits lockout after 2-3 attempts as normal.
-5. Send in PARALLEL → observe: more than 3 requests return "Invalid username or password" (not lockout).
-6. Send to Turbo Intruder. Change username=carlos.
-7. Select template: examples/race-single-packet-attack.py
-8. Set engine=Engine.BURP2, concurrentConnections=1.
-9. Queue all password candidates into gate='1', openGate('1').
-10. Sort results by length → look for 302 response → that's the valid password.
-11. Wait for lockout to reset → log in as carlos.
-```
-
----
-
-### Lab 3: Multi-Endpoint — Cart Checkout Bypass
-
-**Goal:** Add an expensive item to the cart after payment is validated but before order is confirmed.
-
-```
-1. Buy a gift card to study the flow. Note POST /cart and POST /cart/checkout.
-2. Add both to a Repeater group.
-3. Add GET / (homepage) at the start of the group.
-4. Send group in sequence (SINGLE connection) → note first request is slower (connection setup).
-5. Remove GET / → now two requests are timed closely.
-6. Set POST /cart productId=1 (leather jacket).
-7. Send in SEQUENCE → "insufficient funds" expected.
-8. Add gift card back to cart.
-9. Send in PARALLEL → if 200 response to checkout, check if jacket was purchased.
-10. Repeat if needed — this is probabilistic.
-```
-
----
-
-### Lab 4: Single-Endpoint — Email Change Token Hijack
-
-**Goal:** Cause victim's confirmation email to contain attacker's token (or vice versa) via parallel email change requests.
-
-```
-1. Change your email → observe a confirmation link is sent.
-2. Change email twice in quick succession → second change invalidates first token.
-3. Infer: only one pending email stored at a time → shared DB record → collision potential.
-4. Send POST /my-account/change-email to Repeater → group + duplicate 19 times.
-5. Give each tab a different email address (test1@..., test2@..., etc.)
-6. Send group in SEQUENCE → receive 20 separate confirmation emails (correct).
-7. Send group in PARALLEL → observe: confirmation emails sent to WRONG addresses.
-8. Create 2-tab group:
-   - Tab A: email=anything@YOUR-EXPLOIT-SERVER.net
-   - Tab B: email=carlos@ginandjuice.shop
-9. Send in PARALLEL repeatedly.
-10. When email body shows carlos@ginandjuice.shop but arrives in YOUR inbox → click the link.
-11. Access admin panel → delete carlos.
-```
-
----
-
-### Lab 5: Partial Construction — Register with Null Token
-
-**Goal:** Confirm a user registration during the window when the confirmation token is still null.
-
-```
-1. Study registration: requires @ginandjuice.shop email + confirmation token from email.
-2. Read /resources/static/users.js → find confirmation endpoint: POST /confirm?token=...
-3. Test token values:
-   - token=1      → "Incorrect token"
-   - no token     → "Missing parameter"
-   - token=       → "Forbidden"  ← suggests empty was previously exploitable
-   - token[]=     → "Invalid token: Array"  ← empty array passes! Matches null in DB
-4. In Repeater, set up two tabs in a group:
-   - Tab A: POST /register (with unique username each attempt)
-   - Tab B: POST /confirm?token[]=
-5. Send sequentially → confirm response arrives much faster than register response.
-6. Send to Turbo Intruder (highlight username → right-click → Send to Turbo Intruder).
-7. Use race-single-packet-attack.py template:
-   - Queue one registration per attempt (with gate=attempt_number)
-   - Queue 50 confirmation requests (token[]= ) per attempt (same gate)
-   - engine.openGate(attempt_number)
-8. Sort results by Length → find 200 responses to /confirm with "Account registration successful".
-9. Log in with that username and the known static password.
-10. Visit admin panel → delete carlos.
-```
-
----
-
-### Lab 6: Time-Sensitive — Password Reset Token Collision
-
-**Goal:** Trigger two password resets for different users at the same millisecond → same token → reset victim's password.
-
-```
-1. Reset your own password → get token in email → note it changes every request.
-2. Send POST /forgot-password to Repeater → duplicate into 2-tab group.
-3. Send pair in PARALLEL → check email → still different tokens.
-   (Requests still processed sequentially — PHP session lock)
-4. GET /forgot-password WITHOUT session cookie → copy new session + CSRF token.
-5. Paste new session/CSRF into ONE of the two POST requests.
-   (Now two different sessions → can run truly in parallel)
-6. Send pair in PARALLEL repeatedly.
-7. When processing times match → check email → SAME token in both emails!
-   (Confirms timestamp-based token generation)
-8. Change username= in one of the two requests to 'carlos'.
-9. Send pair in PARALLEL until only ONE email arrives in YOUR inbox.
-   (Other email with same token went to carlos)
-10. Copy your reset link → change ?username=your_name to ?username=carlos.
-11. Visit URL → set new password → log in as carlos → delete carlos.
-```
-
----
-
-## 10. Defense & Prevention
+## 9. Defense & Prevention
 
 ### Core Principle: Eliminate Sub-States
 
@@ -570,7 +436,7 @@ For some systems, avoid server-side state entirely. Use encrypted tokens (JWTs) 
 
 ---
 
-## 11. Quick Reference Cheat Sheet
+## 10. Quick Reference Cheat Sheet
 
 ### Signs a Endpoint May Be Vulnerable
 
@@ -628,5 +494,3 @@ def handleResponse(req, interesting):
 | `Invalid token: Array` | Null-param trick accepted (partial construction candidate) |
 
 ---
-
-*Sources: PortSwigger Web Security Academy — Race Conditions module; "Smashing the state machine: The true potential of web race conditions" — PortSwigger Research (Black Hat USA 2023)*

